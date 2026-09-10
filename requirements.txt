@@ -1,2 +1,0 @@
-playwright==1.52.0
-paho-mqtt==2.1.0
