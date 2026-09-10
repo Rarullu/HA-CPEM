@@ -66,8 +66,12 @@ MQTT_PASS = options["mqtt_pass"]
 LOGIN_URL = "https://oficina.cepm.com.do/Account/Login"
 NIVEL2_URL = "https://oficina.cepm.com.do/Home/Nivel2"
 
+DEBUG_SCREENSHOT = "/share/cepm_prepago_debug.png"
+DEBUG_HTML = "/share/cepm_prepago_debug.html"
+
 log("Configuracion cargada")
 log(f"Usuario CEPM: {CEPM_USER}")
+log(f"Longitud de la contrasena: {len(CEPM_PASS) if CEPM_PASS else 0}")
 log(f"Cuenta prepago: {CUENTA_PREPAGO}")
 log(f"Intervalo de sondeo: {POLL_INTERVAL_MIN} min")
 
@@ -107,6 +111,7 @@ def publish_discovery():
             "name": "CEPM Prepago Proyeccion 30 Dias",
             "unit": "kWh",
         },
+        "login_status": {"name": "CEPM Prepago Login Status", "unit": ""},
     }
 
     for key, sensor in sensors.items():
@@ -141,6 +146,40 @@ def parse_number(raw):
         return float(raw.replace(",", ""))
     except ValueError:
         return None
+
+
+def guardar_diagnostico(page, html):
+    """Guarda captura de pantalla y HTML en /share para poder revisarlos
+    desde File editor o Samba sin necesidad de terminal."""
+    try:
+        page.screenshot(path=DEBUG_SCREENSHOT, full_page=True)
+        log(f"Captura de diagnostico guardada en {DEBUG_SCREENSHOT}")
+    except Exception:
+        log("No se pudo guardar la captura de pantalla de diagnostico")
+
+    try:
+        with open(DEBUG_HTML, "w", encoding="utf-8") as f:
+            f.write(html)
+        log(f"HTML de diagnostico guardado en {DEBUG_HTML}")
+    except Exception:
+        log("No se pudo guardar el HTML de diagnostico")
+
+
+def buscar_mensaje_error(html):
+    """Busca mensajes de error tipicos de validacion en la pagina de login."""
+    patrones = [
+        r'<[^>]*class="[^"]*(?:validation-summary-errors|text-danger|alert-danger|field-validation-error)[^"]*"[^>]*>(.*?)</',
+        r'(usuario o contrase\u00f1a incorrect[oa]s?)',
+        r'(credenciales? inv\u00e1lid[oa]s?)',
+        r'(cuenta bloqueada)',
+    ]
+    for patron in patrones:
+        m = re.search(patron, html, re.IGNORECASE | re.DOTALL)
+        if m:
+            texto = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+            if texto:
+                return texto
+    return None
 
 
 def extract_prepago_balance(html, cuenta):
@@ -228,6 +267,8 @@ def scrape():
 
     log("Iniciando navegador Playwright")
 
+    login_status = "desconocido"
+
     with sync_playwright() as p:
 
         browser = p.chromium.launch(
@@ -250,9 +291,43 @@ def scrape():
         page.wait_for_selector("text=Entrar")
         page.locator("text=Entrar").click()
 
-        page.wait_for_timeout(10000)
+        page.wait_for_timeout(6000)
 
-        log(f"URL actual: {page.url}")
+        current_url = page.url
+        log(f"URL actual tras login: {current_url}")
+
+        if "Account/Login" in current_url:
+
+            login_status = "fallo"
+            log("EL LOGIN NO REDIRIGIO fuera de la pagina de login")
+
+            html_login = page.content()
+
+            mensaje_error = buscar_mensaje_error(html_login)
+            if mensaje_error:
+                log(f"Mensaje de error detectado en la pagina: {mensaje_error}")
+            else:
+                log("No se detecto un mensaje de error visible en la pagina")
+
+            guardar_diagnostico(page, html_login)
+
+            browser.close()
+
+            return {
+                "balance_rd": None,
+                "balance_kwh": None,
+                "fecha": datetime.now().strftime("%d/%b. %I:%M %p"),
+                "lectura_acumulada": None,
+                "consumo_ultimo_intervalo": None,
+                "consumo_periodo": None,
+                "promedio_diario": None,
+                "proyeccion_30d": None,
+                "login_status": f"fallo: {mensaje_error or 'sin mensaje visible'}",
+                "timestamp": int(time.time())
+            }
+
+        login_status = "ok"
+        log("Login exitoso")
 
         html_home = page.content()
 
@@ -273,10 +348,24 @@ def scrape():
         consumo_ultimo_intervalo = None
 
         try:
-            log("Abriendo pagina de consumo (Nivel2)")
+            log("Abriendo pagina de consumo (Nivel2) via boton del menu")
 
-            page.goto(NIVEL2_URL)
-            page.wait_for_timeout(3000)
+            try:
+                page.click('button[name="consumo"]')
+                page.wait_for_timeout(3000)
+            except Exception:
+                log("No se encontro el boton del menu, probando goto directo")
+                page.goto(NIVEL2_URL)
+                page.wait_for_timeout(3000)
+
+            log(f"URL tras navegar a consumo: {page.url}")
+
+            try:
+                page.wait_for_selector("#Cuenta", timeout=15000)
+            except Exception:
+                log("El selector #Cuenta no aparecio en la pagina")
+                guardar_diagnostico(page, page.content())
+                raise
 
             log(f"Seleccionando cuenta {CUENTA_PREPAGO}")
 
@@ -297,6 +386,7 @@ def scrape():
         except Exception:
             log("ERROR obteniendo datos de consumo (Nivel2)")
             log(traceback.format_exc())
+            guardar_diagnostico(page, page.content())
 
         browser.close()
 
@@ -309,6 +399,7 @@ def scrape():
             "consumo_periodo": consumo_periodo,
             "promedio_diario": promedio_diario,
             "proyeccion_30d": proyeccion_30d,
+            "login_status": login_status,
             "timestamp": int(time.time())
         }
 
