@@ -245,24 +245,40 @@ def extract_balance_cuenta(html, cuenta):
 
 
 def extract_lectura_acumulada(html):
-    pattern = (
-        r'<td class="nivel2-col-90">[\d-]+<br\s*/>\s*([\d,\.]+)\s*</td>\s*'
-        r'<td class="nivel2-col-90"[^>]*>[\d-]+\s*<br\s*/>\s*([\d,\.]+)\s*</td>\s*'
-        r'<td class="nivel2-col-80">\s*([\d.]+)\s*</td>\s*'
-        r'<td class="nivel2-col-80">([\d.]+)</td>\s*'
-        r'<td class="nivel2-col-80">([\d.]+)</td>'
+    """
+    Extrae los 5 valores numericos de la tabla 'nivel2-table-proyeccion'
+    (Lectura inicial, Lectura final, Consumo, Promedio diario, Proyeccion
+    30 dias) buscando solo dentro de ese bloque, sin depender de la
+    estructura exacta de cada <td> (mas tolerante a variaciones de
+    espacios/atributos que un regex rigido por celda).
+    """
+    bloque_match = re.search(
+        r'<table class="nivel2-table-proyeccion".*?</table>',
+        html,
+        re.DOTALL
     )
-    m = re.search(pattern, html, re.DOTALL)
 
-    if not m:
-        log("No se encontro la tabla de lectura acumulada")
+    if not bloque_match:
+        log("No se encontro el bloque de la tabla nivel2-table-proyeccion")
+        idx_seccion = html.find("CONSUMO CADA DIA")
+        if idx_seccion != -1:
+            log(f"Contexto alrededor de 'CONSUMO CADA DIA': {html[idx_seccion:idx_seccion+800]}")
         return None, None, None, None
 
-    lectura_ini = parse_number(m.group(1))
-    lectura_fin = parse_number(m.group(2))
-    consumo_periodo = float(m.group(3))
-    promedio_diario = float(m.group(4))
-    proyeccion_30d = float(m.group(5))
+    bloque = bloque_match.group(0)
+
+    numeros = re.findall(r'[\d,]+\.\d{2}', bloque)
+
+    if len(numeros) < 5:
+        log(f"Se encontraron solo {len(numeros)} numeros en la tabla de lectura (se esperaban 5)")
+        log(f"Contenido del bloque: {bloque[:500]}")
+        return None, None, None, None
+
+    lectura_ini = parse_number(numeros[0])
+    lectura_fin = parse_number(numeros[1])
+    consumo_periodo = parse_number(numeros[2])
+    promedio_diario = parse_number(numeros[3])
+    proyeccion_30d = parse_number(numeros[4])
 
     log(f"Lectura inicial: {lectura_ini} / Lectura final: {lectura_fin}")
 
