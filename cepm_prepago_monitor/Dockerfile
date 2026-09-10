@@ -162,16 +162,10 @@ def publish_discovery():
         "login_status": {"name": "CEPM Login Status", "unit": ""},
     }
 
-    etiquetas_dia = {
-        1: "Ayer", 2: "Hace 2 Dias", 3: "Hace 3 Dias", 4: "Hace 4 Dias",
-        5: "Hace 5 Dias", 6: "Hace 6 Dias", 7: "Hace 7 Dias",
-        8: "Hace 8 Dias", 9: "Hace 9 Dias", 10: "Hace 10 Dias",
-    }
-
     for prefijo, etiqueta_cuenta in [("prepago", "Prepago"), ("postpago", "Postpago")]:
         for i in range(1, 11):
             sensors[f"{prefijo}_consumo_dia_{i}"] = {
-                "name": f"CEPM {etiqueta_cuenta} Consumo {etiquetas_dia[i]}",
+                "name": f"CEPM {etiqueta_cuenta} Consumo Dia {i}",
                 "unit": "kWh",
             }
 
