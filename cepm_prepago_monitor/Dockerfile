@@ -40,7 +40,7 @@ import json
 import re
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 
 print("CEPM MONITOR MEDIDORES INICIADO", flush=True)
 
@@ -118,6 +118,14 @@ def publish_discovery():
             "name": "CEPM Prepago Proyeccion 30 Dias",
             "unit": "kWh",
         },
+        "prepago_consumo_ultima_hora": {
+            "name": "CEPM Prepago Consumo Ultima Hora",
+            "unit": "kWh",
+        },
+        "prepago_consumo_hoy": {
+            "name": "CEPM Prepago Consumo Hoy",
+            "unit": "kWh",
+        },
 
         # --- Postpago: solo consumo/lectura (no aplica corte por saldo) ---
         "postpago_lectura_acumulada": {
@@ -142,9 +150,30 @@ def publish_discovery():
             "name": "CEPM Postpago Proyeccion 30 Dias",
             "unit": "kWh",
         },
+        "postpago_consumo_ultima_hora": {
+            "name": "CEPM Postpago Consumo Ultima Hora",
+            "unit": "kWh",
+        },
+        "postpago_consumo_hoy": {
+            "name": "CEPM Postpago Consumo Hoy",
+            "unit": "kWh",
+        },
 
         "login_status": {"name": "CEPM Login Status", "unit": ""},
     }
+
+    etiquetas_dia = {
+        1: "Ayer", 2: "Hace 2 Dias", 3: "Hace 3 Dias", 4: "Hace 4 Dias",
+        5: "Hace 5 Dias", 6: "Hace 6 Dias", 7: "Hace 7 Dias",
+        8: "Hace 8 Dias", 9: "Hace 9 Dias", 10: "Hace 10 Dias",
+    }
+
+    for prefijo, etiqueta_cuenta in [("prepago", "Prepago"), ("postpago", "Postpago")]:
+        for i in range(1, 11):
+            sensors[f"{prefijo}_consumo_dia_{i}"] = {
+                "name": f"CEPM {etiqueta_cuenta} Consumo {etiquetas_dia[i]}",
+                "unit": "kWh",
+            }
 
     for key, sensor in sensors.items():
 
@@ -285,12 +314,14 @@ def extract_lectura_acumulada(html):
     return lectura_fin, consumo_periodo, promedio_diario, proyeccion_30d
 
 
-def extract_intervalo_15min(html):
+def extract_intervalos_15min(html):
+    """Devuelve la lista completa [(datetime, valor), ...] del bloque de
+    consumo cada 15 minutos (el primer 'data.addRows([...])' de la pagina)."""
     blocks = re.findall(r'data\.addRows\(\[(.*?)\]\);', html, re.DOTALL)
 
     if not blocks:
         log("No se encontraron bloques addRows en la pagina Nivel2")
-        return None
+        return []
 
     bloque_min = blocks[0]
 
@@ -301,19 +332,52 @@ def extract_intervalo_15min(html):
 
     if not entradas:
         log("No se pudieron parsear entradas de 15 minutos")
-        return None
+        return []
 
-    ultimo = entradas[-1]
-    valor = float(ultimo[5])
+    resultado = []
+    for anio, mes, dia, hora, minuto, valor in entradas:
+        # Los meses en JS van de 0 a 11
+        dt = datetime(int(anio), int(mes) + 1, int(dia), int(hora), int(minuto))
+        resultado.append((dt, float(valor)))
 
-    log(f"Ultimo intervalo de 15 min: {valor} kWh")
+    return resultado
 
-    return valor
+
+def extract_diario(html):
+    """Devuelve la lista [(date, valor), ...] del bloque de consumo por
+    dia (el segundo 'data.addRows([...])' de la pagina), tal como CEPM
+    ya lo calcula - sin que nosotros tengamos que sumar nada."""
+    blocks = re.findall(r'data\.addRows\(\[(.*?)\]\);', html, re.DOTALL)
+
+    if len(blocks) < 2:
+        log("No se encontro el bloque de consumo diario en la pagina Nivel2")
+        return []
+
+    bloque_dia = blocks[1]
+
+    entradas = re.findall(
+        r'\[new Date\((\d+),\s*(\d+),\s*(\d+)\),\s*([\d.]+)\]',
+        bloque_dia
+    )
+
+    if not entradas:
+        log("No se pudieron parsear entradas de consumo diario")
+        return []
+
+    resultado = []
+    for anio, mes, dia, valor in entradas:
+        d = datetime(int(anio), int(mes) + 1, int(dia)).date()
+        resultado.append((d, float(valor)))
+
+    return resultado
 
 
 def obtener_datos_consumo(page, cuenta):
     """Selecciona la cuenta indicada en la pagina Nivel2 (ya abierta) y
-    extrae su lectura acumulada y consumo. Devuelve un dict."""
+    extrae su lectura acumulada y consumo (ultimo intervalo, ultima hora,
+    hoy, y los ultimos 10 dias) tomando siempre valores ya calculados por
+    CEPM, sin acumular nosotros nada aparte de sumar intervalos de 15 min
+    que ya vienen desglosados."""
 
     log(f"Seleccionando cuenta {cuenta}")
 
@@ -340,25 +404,68 @@ def obtener_datos_consumo(page, cuenta):
         proyeccion_30d,
     ) = extract_lectura_acumulada(html)
 
-    consumo_ultimo_intervalo = extract_intervalo_15min(html)
+    intervalos = extract_intervalos_15min(html)
+    diarios = extract_diario(html)
 
-    return {
+    consumo_ultimo_intervalo = None
+    consumo_ultima_hora = None
+    consumo_hoy = None
+
+    if intervalos:
+        consumo_ultimo_intervalo = intervalos[-1][1]
+
+        ultima_fecha = intervalos[-1][0]
+        hace_una_hora = ultima_fecha - timedelta(hours=1)
+
+        consumo_ultima_hora = round(
+            sum(v for dt, v in intervalos if dt > hace_una_hora), 3
+        )
+        consumo_hoy = round(
+            sum(v for dt, v in intervalos if dt.date() == ultima_fecha.date()), 3
+        )
+
+        log(f"Ultimo intervalo: {consumo_ultimo_intervalo} / "
+            f"Ultima hora: {consumo_ultima_hora} / Hoy: {consumo_hoy}")
+    else:
+        log("No se pudo calcular ultima hora / hoy (sin intervalos de 15 min)")
+
+    dias_ordenados = sorted(diarios, key=lambda item: item[0], reverse=True)[:10]
+
+    resultado = {
         "lectura_acumulada": lectura_fin,
         "consumo_ultimo_intervalo": consumo_ultimo_intervalo,
+        "consumo_ultima_hora": consumo_ultima_hora,
+        "consumo_hoy": consumo_hoy,
         "consumo_periodo": consumo_periodo,
         "promedio_diario": promedio_diario,
         "proyeccion_30d": proyeccion_30d,
     }
 
+    for i in range(10):
+        clave = f"consumo_dia_{i + 1}"
+        if i < len(dias_ordenados):
+            fecha_dia, valor_dia = dias_ordenados[i]
+            resultado[clave] = valor_dia
+            log(f"{clave} ({fecha_dia}): {valor_dia} kWh")
+        else:
+            resultado[clave] = None
+
+    return resultado
+
 
 def valores_vacios_consumo():
-    return {
+    valores = {
         "lectura_acumulada": None,
         "consumo_ultimo_intervalo": None,
+        "consumo_ultima_hora": None,
+        "consumo_hoy": None,
         "consumo_periodo": None,
         "promedio_diario": None,
         "proyeccion_30d": None,
     }
+    for i in range(10):
+        valores[f"consumo_dia_{i + 1}"] = None
+    return valores
 
 
 def scrape():
