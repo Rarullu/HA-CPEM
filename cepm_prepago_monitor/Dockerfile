@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y \
     libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir playwright==1.52.0 paho-mqtt==2.1.0
+RUN pip install --no-cache-dir playwright==1.52.0 paho-mqtt==2.1.0 requests==2.32.3
 
 RUN playwright install chromium
 
@@ -38,8 +38,10 @@ from playwright.sync_api import sync_playwright
 import paho.mqtt.client as mqtt
 import json
 import re
+import os
 import time
 import traceback
+import requests
 from datetime import datetime, timedelta
 
 print("CEPM MONITOR MEDIDORES INICIADO", flush=True)
@@ -105,6 +107,7 @@ def publish_discovery():
         "prepago_consumo_ultimo_intervalo": {
             "name": "CEPM Prepago Consumo Ultimo Intervalo 15min",
             "unit": "kWh",
+            "state_class": "measurement",
         },
         "prepago_consumo_periodo": {
             "name": "CEPM Prepago Consumo Periodo Consultado",
@@ -113,18 +116,28 @@ def publish_discovery():
         "prepago_promedio_diario": {
             "name": "CEPM Prepago Promedio Diario",
             "unit": "kWh",
+            "state_class": "measurement",
         },
         "prepago_proyeccion_30d": {
             "name": "CEPM Prepago Proyeccion 30 Dias",
             "unit": "kWh",
+            "state_class": "measurement",
         },
         "prepago_consumo_ultima_hora": {
             "name": "CEPM Prepago Consumo Ultima Hora",
             "unit": "kWh",
+            "state_class": "measurement",
         },
         "prepago_consumo_hoy": {
             "name": "CEPM Prepago Consumo Hoy",
             "unit": "kWh",
+            "state_class": "measurement",
+        },
+        "prepago_consumo_acumulado_diario": {
+            "name": "CEPM Prepago Consumo Acumulado Diario",
+            "unit": "kWh",
+            "device_class": "energy",
+            "state_class": "total_increasing",
         },
 
         # --- Postpago: solo consumo/lectura (no aplica corte por saldo) ---
@@ -137,6 +150,7 @@ def publish_discovery():
         "postpago_consumo_ultimo_intervalo": {
             "name": "CEPM Postpago Consumo Ultimo Intervalo 15min",
             "unit": "kWh",
+            "state_class": "measurement",
         },
         "postpago_consumo_periodo": {
             "name": "CEPM Postpago Consumo Periodo Consultado",
@@ -145,21 +159,35 @@ def publish_discovery():
         "postpago_promedio_diario": {
             "name": "CEPM Postpago Promedio Diario",
             "unit": "kWh",
+            "state_class": "measurement",
         },
         "postpago_proyeccion_30d": {
             "name": "CEPM Postpago Proyeccion 30 Dias",
             "unit": "kWh",
+            "state_class": "measurement",
         },
         "postpago_consumo_ultima_hora": {
             "name": "CEPM Postpago Consumo Ultima Hora",
             "unit": "kWh",
+            "state_class": "measurement",
         },
         "postpago_consumo_hoy": {
             "name": "CEPM Postpago Consumo Hoy",
             "unit": "kWh",
+            "state_class": "measurement",
+        },
+        "postpago_consumo_acumulado_diario": {
+            "name": "CEPM Postpago Consumo Acumulado Diario",
+            "unit": "kWh",
+            "device_class": "energy",
+            "state_class": "total_increasing",
         },
 
         "login_status": {"name": "CEPM Login Status", "unit": ""},
+        "fecha_servidor_cepm": {
+            "name": "CEPM Fecha Servidor (ultima consulta)",
+            "unit": "",
+        },
     }
 
     for prefijo, etiqueta_cuenta in [("prepago", "Prepago"), ("postpago", "Postpago")]:
@@ -167,6 +195,7 @@ def publish_discovery():
             sensors[f"{prefijo}_consumo_dia_{i}"] = {
                 "name": f"CEPM {etiqueta_cuenta} Consumo Dia {i}",
                 "unit": "kWh",
+                "state_class": "measurement",
             }
 
     for key, sensor in sensors.items():
@@ -231,6 +260,17 @@ def buscar_mensaje_error(html):
             texto = re.sub(r'<[^>]+>', '', m.group(1)).strip()
             if texto:
                 return texto
+    return None
+
+
+def extract_fecha_servidor(html):
+    """Extrae la fecha/hora que el propio servidor de CEPM muestra en la
+    barra de navegacion (ej. '9/10/2026 9:55:18 AM'). Es la hora real de
+    CEPM, no la del contenedor donde corre este addon (pueden diferir)."""
+    m = re.search(r'<span class="me-3 text-muted">([^<]+)</span>', html)
+    if m:
+        return m.group(1).strip()
+    log("No se encontro la fecha del servidor CEPM en la barra de navegacion")
     return None
 
 
@@ -308,6 +348,83 @@ def extract_lectura_acumulada(html):
     return lectura_fin, consumo_periodo, promedio_diario, proyeccion_30d
 
 
+SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN")
+HA_API_URL = "http://supervisor/core/api/services/recorder/import_statistics"
+
+# Republica DR no tiene horario de verano, siempre UTC-4
+ZONA_HORARIA_LOCAL = "-04:00"
+
+
+def calcular_cumulativo(diarios):
+    """A partir de [(fecha, valor_del_dia), ...] (en cualquier orden)
+    devuelve una lista ordenada cronologicamente de
+    (fecha, valor_del_dia, acumulado_hasta_ese_dia_inclusive).
+    Este acumulado reconstruido es lo que se guarda como historico real
+    por fecha (no depende de nuestra frecuencia de sondeo)."""
+    ordenados = sorted(diarios, key=lambda item: item[0])
+    acumulado = 0.0
+    resultado = []
+    for fecha, valor in ordenados:
+        acumulado += valor
+        resultado.append((fecha, valor, acumulado))
+    return resultado
+
+
+def importar_estadisticas_historicas(statistic_id, unit, cumulativo):
+    """Envia a Home Assistant, via la API del propio Supervisor, el
+    historico diario reconstruido para que quede guardado de forma
+    permanente ligado a la fecha real de cada dia."""
+
+    if not SUPERVISOR_TOKEN:
+        log("SUPERVISOR_TOKEN no disponible: no se puede importar historico "
+            "(revisa que 'homeassistant_api: true' este en config.json y "
+            "que el addon se haya reinstalado tras el cambio)")
+        return
+
+    if not cumulativo:
+        log(f"Sin datos diarios para importar historico de {statistic_id}")
+        return
+
+    stats = []
+    for fecha, _valor_dia, acumulado in cumulativo:
+        inicio = datetime(fecha.year, fecha.month, fecha.day, 0, 0, 0)
+        stats.append({
+            "start": inicio.isoformat() + ZONA_HORARIA_LOCAL,
+            "sum": round(acumulado, 3),
+        })
+
+    payload = {
+        "metadata": {
+            "has_mean": False,
+            "has_sum": True,
+            "statistic_id": statistic_id,
+            "unit_of_measurement": unit,
+            "source": "recorder",
+        },
+        "stats": stats,
+    }
+
+    try:
+        resp = requests.post(
+            HA_API_URL,
+            headers={
+                "Authorization": f"Bearer {SUPERVISOR_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=20,
+        )
+        if resp.status_code >= 300:
+            log(f"Error importando historico de {statistic_id}: "
+                f"HTTP {resp.status_code} - {resp.text[:400]}")
+        else:
+            log(f"Historico importado OK para {statistic_id} "
+                f"({len(stats)} dias, del {stats[0]['start']} al {stats[-1]['start']})")
+    except Exception:
+        log(f"Excepcion importando historico de {statistic_id}")
+        log(traceback.format_exc())
+
+
 def extract_intervalos_15min(html):
     """Devuelve la lista completa [(datetime, valor), ...] del bloque de
     consumo cada 15 minutos (el primer 'data.addRows([...])' de la pagina)."""
@@ -366,12 +483,14 @@ def extract_diario(html):
     return resultado
 
 
-def obtener_datos_consumo(page, cuenta):
+def obtener_datos_consumo(page, cuenta, prefijo):
     """Selecciona la cuenta indicada en la pagina Nivel2 (ya abierta) y
     extrae su lectura acumulada y consumo (ultimo intervalo, ultima hora,
     hoy, y los ultimos 10 dias) tomando siempre valores ya calculados por
     CEPM, sin acumular nosotros nada aparte de sumar intervalos de 15 min
-    que ya vienen desglosados."""
+    que ya vienen desglosados. Ademas reconstruye un acumulado diario real
+    (por fecha) y lo importa como estadistica historica permanente en
+    Home Assistant."""
 
     log(f"Seleccionando cuenta {cuenta}")
 
@@ -425,11 +544,21 @@ def obtener_datos_consumo(page, cuenta):
 
     dias_ordenados = sorted(diarios, key=lambda item: item[0], reverse=True)[:10]
 
+    # --- Reconstruir acumulado real por fecha e importarlo como historico ---
+    cumulativo = calcular_cumulativo(diarios)
+
+    statistic_id = f"sensor.cepm_{prefijo}_consumo_acumulado_diario"
+    importar_estadisticas_historicas(statistic_id, "kWh", cumulativo)
+
+    acumulado_base = cumulativo[-1][2] if cumulativo else 0.0
+    consumo_acumulado_diario = round(acumulado_base + (consumo_hoy or 0), 3)
+
     resultado = {
         "lectura_acumulada": lectura_fin,
         "consumo_ultimo_intervalo": consumo_ultimo_intervalo,
         "consumo_ultima_hora": consumo_ultima_hora,
         "consumo_hoy": consumo_hoy,
+        "consumo_acumulado_diario": consumo_acumulado_diario,
         "consumo_periodo": consumo_periodo,
         "promedio_diario": promedio_diario,
         "proyeccion_30d": proyeccion_30d,
@@ -453,6 +582,7 @@ def valores_vacios_consumo():
         "consumo_ultimo_intervalo": None,
         "consumo_ultima_hora": None,
         "consumo_hoy": None,
+        "consumo_acumulado_diario": None,
         "consumo_periodo": None,
         "promedio_diario": None,
         "proyeccion_30d": None,
@@ -471,6 +601,7 @@ def scrape():
         "prepago_balance_kwh": None,
         "prepago_fecha_balance": None,
         "login_status": "desconocido",
+        "fecha_servidor_cepm": None,
     }
     resultado.update({f"prepago_{k}": v for k, v in valores_vacios_consumo().items()})
     resultado.update({f"postpago_{k}": v for k, v in valores_vacios_consumo().items()})
@@ -528,6 +659,10 @@ def scrape():
 
         html_home = page.content()
 
+        fecha_servidor_cepm = extract_fecha_servidor(html_home)
+        resultado["fecha_servidor_cepm"] = fecha_servidor_cepm
+        log(f"Fecha/hora del servidor CEPM: {fecha_servidor_cepm}")
+
         balance_rd, balance_kwh, fecha = extract_balance_cuenta(
             html_home, CUENTA_PREPAGO
         )
@@ -558,10 +693,10 @@ def scrape():
 
             page.wait_for_selector("#Cuenta", timeout=15000)
 
-            datos_prepago = obtener_datos_consumo(page, CUENTA_PREPAGO)
+            datos_prepago = obtener_datos_consumo(page, CUENTA_PREPAGO, "prepago")
             resultado.update({f"prepago_{k}": v for k, v in datos_prepago.items()})
 
-            datos_postpago = obtener_datos_consumo(page, CUENTA_POSTPAGO)
+            datos_postpago = obtener_datos_consumo(page, CUENTA_POSTPAGO, "postpago")
             resultado.update({f"postpago_{k}": v for k, v in datos_postpago.items()})
 
         except Exception:
