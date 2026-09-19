@@ -83,6 +83,7 @@ if MQTT_USER:
     client.username_pw_set(MQTT_USER, MQTT_PASS)
 
 client.connect(MQTT_HOST, MQTT_PORT, 60)
+client.loop_start()
 
 DISCOVERY_PREFIX = "homeassistant"
 BASE_TOPIC = "cepm_medidores"
@@ -727,13 +728,20 @@ while True:
 
         log(f"Datos obtenidos: {data}")
 
-        client.publish(
+        info = client.publish(
             f"{BASE_TOPIC}/state",
             json.dumps(data),
             retain=True
         )
 
-        log("MQTT publicado correctamente")
+        if info.rc == mqtt.MQTT_ERR_SUCCESS:
+            log("MQTT publicado correctamente")
+        else:
+            log(f"ERROR: MQTT publish devolvio codigo {info.rc} "
+                f"({mqtt.error_string(info.rc)})")
+
+        if not client.is_connected():
+            log("ADVERTENCIA: el cliente MQTT no esta conectado en este momento")
 
     except Exception:
 
